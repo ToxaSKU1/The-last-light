@@ -4916,15 +4916,51 @@ function rewindAutosaveIndexIfPastColdSceneEnd(savedWaitingNext) {
 }
 
 // Применяет уже разобранный и проверенный контроллером payload к состоянию, медиа и интерфейсу истории.
-function applyAutosavePayload(data, raw) {
-  function isUsableAutosaveBgSrc(src) {
-    var normalized = normalizeAssetUrl(src || "");
-    if (!normalized) return false;
-    var currentPage = normalizeAssetUrl((window && window.location && window.location.href) ? window.location.href : "");
-    if (currentPage && urlsMatchForAutosaveRestore(normalized, currentPage)) return false;
-    return true;
-  }
+// Старые автосейвы сохраняют абсолютные URL. После переноса игры используем
+// их путь внутри assets, проверенный политикой ресурсов текущего проекта.
+function resolveAutosaveVisualSource(src, kind) {
+  if (typeof src !== "string" || !src) return "";
+  var policy = window.VNResourcePathPolicy;
+  var page = window.location.href;
+  var direct = policy.resolve(src, page, kind);
+  if (direct.ok) return direct.url;
 
+  try {
+    var previous = new URL(src);
+    if (!["file:", "http:", "https:"].includes(previous.protocol) ||
+      previous.username || previous.password || previous.search || previous.hash) return "";
+
+    var currentAssets = new URL("assets/", page).href;
+    var oldAssetsIndex = previous.pathname.lastIndexOf("/assets/");
+    var relative;
+    if (previous.href.indexOf(currentAssets) === 0) {
+      relative = "assets/" + previous.href.slice(currentAssets.length);
+    } else if (oldAssetsIndex >= 0) {
+      relative = previous.pathname.slice(oldAssetsIndex + 1);
+    } else {
+      return "";
+    }
+    var relocated = policy.resolve(relative, page, kind);
+    return relocated.ok ? relocated.url : "";
+  } catch (error) {
+    return "";
+  }
+}
+
+function restoreAutosaveBackgroundSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  var kind = isBg360PackPath(snapshot.src) ? "panorama" : "background";
+  var src = resolveAutosaveVisualSource(snapshot.src, kind);
+  if (!src) return null;
+  return Object.assign({}, snapshot, {
+    src: src,
+    blurFallback: resolveAutosaveVisualSource(snapshot.blurFallback, "image")
+  });
+}
+
+function applyAutosavePayload(data, raw) {
+  var savedBackground = restoreAutosaveBackgroundSnapshot(data.bg);
+  var restoreBgSnapshot = savedBackground || restoreAutosaveBackgroundSnapshot(data.lastVisualSnapshot);
   var restoreScene = state.sceneMap[data.sceneId];
   var restoreIdx = clamp(
     parseInt(data.actionIndex, 10) || 0,
@@ -4940,8 +4976,8 @@ function applyAutosavePayload(data, raw) {
   if (
     restoreAction &&
     restoreAction.type === "choice" &&
-    !(data.bg && data.bg.src) &&
-    !(data.lastVisualSnapshot && data.lastVisualSnapshot.src)
+    !restoreBgSnapshot &&
+    !data.currentBgId
   ) {
     autosaveDebugLog("restore:skip_legacy_choice_without_visual_snapshot", {
       sceneId: data.sceneId,
@@ -4990,10 +5026,7 @@ function applyAutosavePayload(data, raw) {
   cleanupStoryVideoVisualOnly();
   gameHost.closeFrame("story");
 
-  var restoreBgSnapshot = (data.bg && isUsableAutosaveBgSrc(data.bg.src))
-    ? data.bg
-    : ((data.lastVisualSnapshot && isUsableAutosaveBgSrc(data.lastVisualSnapshot.src)) ? data.lastVisualSnapshot : null);
-  if (restoreBgSnapshot && restoreBgSnapshot.src) {
+  if (restoreBgSnapshot) {
     var baseScroll = { enabled: false, start: 0.5, focusX: null, focusY: null, scale: 1 };
     if (data.bgScroll && typeof data.bgScroll === "object") {
       baseScroll.enabled = !!data.bgScroll.interactive;
@@ -5043,14 +5076,17 @@ function applyAutosavePayload(data, raw) {
   }
   // Если в слоте нет снимка bg, восстанавливаем последний bg из уже пройденных действий сцены.
   // Это защищает от «черного экрана» после F5 на шагах ожидания choice/text.
-  if (!(restoreBgSnapshot && restoreBgSnapshot.src)) {
+  if (!restoreBgSnapshot) {
     if (!restoreBgFromCurrentBgIdForAutosave(state.currentBgId)) {
       restoreBgFromScenePrefixForAutosave(state.sceneId, state.actionIndex);
     }
   }
 
   if (data.char && typeof data.char === "object") {
-    characterController.applySnapshot(data.char);
+    var characterSrc = resolveAutosaveVisualSource(data.char.src, "image");
+    if (data.char.hidden || characterSrc) {
+      characterController.applySnapshot(Object.assign({}, data.char, { src: characterSrc }));
+    }
   }
 
   if (Object.prototype.hasOwnProperty.call(data, "bgm")) {
@@ -5086,8 +5122,8 @@ function applyAutosavePayload(data, raw) {
       ? story360RestorePending
       : null;
   vnAutosaveBgScrollRestorePending =
-    data.bg && data.bgScroll && typeof data.bgScroll === "object"
-      ? { dataBg: data.bg, dataBgScroll: data.bgScroll }
+    savedBackground && data.bgScroll && typeof data.bgScroll === "object"
+      ? { dataBg: savedBackground, dataBgScroll: data.bgScroll }
       : null;
   runCurrent();
   autosaveDebugLog("restore:after_runCurrent", {
@@ -5101,13 +5137,12 @@ function applyAutosavePayload(data, raw) {
     gameModalHidden: elGameModal ? elGameModal.classList.contains("hidden") : null
   });
   flushAutosaveBgScrollRestorePending();
-  var blurVideoFb =
-    data.bg && typeof data.bg.blurFallback === "string" ? data.bg.blurFallback : "";
+  var blurVideoFb = restoreBgSnapshot ? restoreBgSnapshot.blurFallback : "";
   requestAnimationFrame(function () {
     flushAutosaveBgScrollRestorePending();
     requestAnimationFrame(function () {
       flushAutosaveBgScrollRestorePending();
-      if (data.bg && data.bg.isVideo) {
+      if (restoreBgSnapshot && restoreBgSnapshot.isVideo) {
         scheduleBlurRefreshFromBgVideo(blurVideoFb);
       }
     });
